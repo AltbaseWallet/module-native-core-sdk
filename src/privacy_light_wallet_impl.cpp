@@ -453,16 +453,16 @@ ZanoWalletFileChoice choose_zano_wallet_file(
   ZanoWalletFileChoice preferred{preferred_file_name, false, 0};
 
   std::error_code ec;
+  bool found_prepared = false;
   if (std::filesystem::exists(preferred_path, ec)) {
     preferred.exists = true;
     preferred.size = safe_file_size(preferred_path);
-    if (zano_wallet_file_is_prepared(preferred.size)) return preferred;
+    found_prepared = zano_wallet_file_is_prepared(preferred.size);
   }
 
   if (!std::filesystem::exists(wallets_dir, ec)) return preferred;
 
   ZanoWalletFileChoice best = preferred;
-  bool found_prepared = false;
   for (const auto& entry : std::filesystem::directory_iterator(wallets_dir, ec)) {
     if (ec) break;
     std::error_code entry_ec;
@@ -490,10 +490,12 @@ bool import_zano_wallet_file_from_cache(
   const std::string& preferred_file_name,
   const std::map<std::string, std::string>& params
 ) {
-  const auto blob = get_param(params, "nativeWalletFileBlob");
+  auto blob = get_param(params, "cachedWalletState");
+  if (blob.empty()) blob = get_param(params, "nativeWalletFileBlob");
   if (blob.empty()) return false;
 
-  auto file_name = get_param(params, "nativeWalletFileName");
+  auto file_name = get_param(params, "cachedWalletName");
+  if (file_name.empty()) file_name = get_param(params, "nativeWalletFileName");
   if (!zano_wallet_file_name_is_safe(file_name, scope)) file_name = preferred_file_name;
   if (!zano_wallet_file_name_is_safe(file_name, scope)) return false;
 
@@ -907,7 +909,7 @@ bool zano_prepared_wallet_available(
   std::filesystem::create_directories(work_dir);
 
   auto wallet_choice = choose_zano_wallet_file(work_dir, secret.scope, preferred_file_name);
-  if (!zano_wallet_file_is_prepared(wallet_choice.size) && import_zano_wallet_file_from_cache(work_dir, secret.scope, preferred_file_name, params)) {
+  if (import_zano_wallet_file_from_cache(work_dir, secret.scope, preferred_file_name, params)) {
     wallet_choice = choose_zano_wallet_file(work_dir, secret.scope, preferred_file_name);
   }
   return zano_wallet_file_is_prepared(wallet_choice.size);
@@ -1235,7 +1237,7 @@ ZanoSession& ensure_zano_wallet(
   const auto wallet_exists = regex_bool(open_response, "walletExists");
 #else
   auto wallet_choice = choose_zano_wallet_file(work_dir, secret.scope, preferred_file_name);
-  if (!zano_wallet_file_is_prepared(wallet_choice.size) && import_zano_wallet_file_from_cache(work_dir, secret.scope, preferred_file_name, params)) {
+  if (import_zano_wallet_file_from_cache(work_dir, secret.scope, preferred_file_name, params)) {
     wallet_choice = choose_zano_wallet_file(work_dir, secret.scope, preferred_file_name);
   }
   if (wallet_choice.exists && !zano_wallet_file_is_prepared(wallet_choice.size)) {
@@ -2394,7 +2396,7 @@ std::string call_zano_core(const std::string& request) {
 
 std::string call_epic_core(const std::string& request, const std::string& action) {
 #ifdef _WIN32
-  const bool sending = action == "send";
+  const bool sending = action == "send" || action == "estimatemax";
   char* raw = sending
     ? altbase_epic_sender_request(request.c_str())
     : altbase_epic_state_request(request.c_str());
@@ -2438,7 +2440,7 @@ std::string call_epic_core(const std::string& request, const std::string& action
   };
   static const EpicModule state = load_module("state");
   static const EpicModule sender = load_module("sender");
-  const auto& module = action == "send" ? sender : state;
+  const auto& module = (action == "send" || action == "estimatemax") ? sender : state;
 
   if (!module.error.empty()) throw std::runtime_error(module.error);
   char* raw = module.request(request.c_str());
@@ -2823,6 +2825,9 @@ PrivacyLightWalletResult epic_wallet(const std::map<std::string, std::string>& p
               << "\"fee\":\"" << json_escape(get_param(params, "fee")) << "\","
               << "\"sendMax\":\"" << json_escape(get_param(params, "sendMax")) << "\","
               << "\"memo\":\"" << json_escape(get_param(params, "memo")) << "\"";
+    } else if (action == "estimatemax") {
+      request << ",\"fee\":\"" << json_escape(get_param(params, "fee")) << "\","
+              << "\"sendMax\":\"true\"";
     }
     request << "}";
 
@@ -3151,10 +3156,10 @@ PrivacyLightWalletResult privacy_light_wallet(const std::map<std::string, std::s
     return not_ready("bad-coin", "Unsupported native privacy coin");
   }
 #endif
-  if (action != "ensure" && action != "warm" && action != "snapshot" && action != "send") {
+  if (action != "ensure" && action != "warm" && action != "snapshot" && action != "send" && action != "estimatemax") {
     return not_ready("bad-action", "Unsupported native privacy light-wallet action");
   }
-  if ((action == "ensure" || action == "warm" || action == "send") && mnemonic.empty()) {
+  if ((action == "ensure" || action == "warm" || action == "send" || action == "estimatemax") && mnemonic.empty()) {
     return not_ready("missing-phrase", "Wallet phrase is required for native privacy wallet");
   }
 
