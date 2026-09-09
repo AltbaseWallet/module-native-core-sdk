@@ -263,6 +263,7 @@ altbase_add_coin_node_module(epic Epic)
 altbase_add_coin_node_module(quai Quai)
 altbase_add_coin_node_module(qubic Qubic)
 altbase_add_coin_node_module(kaspa Kaspa)
+altbase_add_coin_node_module(nonsense Nonsense)
 altbase_add_coin_node_module(ckb NervosCKB)
 
 set(ALTBASE_CORE_BRIDGE_SOURCES

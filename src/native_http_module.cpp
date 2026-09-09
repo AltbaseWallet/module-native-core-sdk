@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -176,6 +177,30 @@ struct Handle {
   operator HINTERNET() const { return value; }
 };
 
+struct WinHttpTransport {
+  std::mutex mutex;
+  Handle session;
+  std::map<std::wstring, std::unique_ptr<Handle>> connections;
+
+  WinHttpTransport()
+    : session(WinHttpOpen(
+        L"AltbaseNativeCore/0.1",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0
+      )) {}
+};
+
+WinHttpTransport& winhttp_transport() {
+  static WinHttpTransport transport;
+  return transport;
+}
+
+std::runtime_error winhttp_error(const char* operation) {
+  return std::runtime_error(std::string(operation) + " failed (Windows error " + std::to_string(GetLastError()) + ")");
+}
+
 std::wstring utf8_to_wide(const std::string& value) {
   if (value.empty()) return L"";
   const int len = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
@@ -221,23 +246,28 @@ HttpResponse do_request(
   const std::string& content_type
 ) {
   const auto parsed = parse_url(url);
-  Handle session(WinHttpOpen(
-    L"AltbaseNativeCore/0.1",
-    WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-    WINHTTP_NO_PROXY_NAME,
-    WINHTTP_NO_PROXY_BYPASS,
-    0
-  ));
-  if (!session) throw std::runtime_error("network request failed");
+  auto& transport = winhttp_transport();
+  std::lock_guard<std::mutex> lock(transport.mutex);
+  if (!transport.session) throw winhttp_error("WinHttpOpen");
 
-  WinHttpSetTimeouts(session, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
+  WinHttpSetTimeouts(transport.session, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
 
-  Handle connect(WinHttpConnect(session, parsed.host.c_str(), parsed.port, 0));
-  if (!connect) throw std::runtime_error("network request failed");
+  const auto connection_key = parsed.host + L":" + std::to_wstring(parsed.port);
+  auto connection = transport.connections.find(connection_key);
+  if (connection == transport.connections.end()) {
+    auto created = std::make_unique<Handle>(WinHttpConnect(
+      transport.session,
+      parsed.host.c_str(),
+      parsed.port,
+      0
+    ));
+    if (!*created) throw winhttp_error("WinHttpConnect");
+    connection = transport.connections.emplace(connection_key, std::move(created)).first;
+  }
 
   const auto wide_method = utf8_to_wide(method);
   Handle req(WinHttpOpenRequest(
-    connect,
+    *connection->second,
     wide_method.c_str(),
     parsed.path.c_str(),
     nullptr,
@@ -245,7 +275,38 @@ HttpResponse do_request(
     WINHTTP_DEFAULT_ACCEPT_TYPES,
     parsed.secure ? WINHTTP_FLAG_SECURE : 0
   ));
-  if (!req) throw std::runtime_error("network request failed");
+  if (!req) throw winhttp_error("WinHttpOpenRequest");
+
+#ifdef WINHTTP_OPTION_RESOLUTION_HOSTNAME
+  // api.altbase.io is an Altbase-owned fixed backend. Preserve its hostname
+  // for TLS SNI and certificate verification, but bypass a dead system DNS
+  // resolver by giving WinHTTP the backend address to resolve against.
+  if (parsed.secure && parsed.host == L"api.altbase.io") {
+    std::wstring backend_address = L"212.43.147.158";
+    WinHttpSetOption(
+      req,
+      WINHTTP_OPTION_RESOLUTION_HOSTNAME,
+      backend_address.data(),
+      static_cast<DWORD>((backend_address.size() + 1) * sizeof(wchar_t))
+    );
+  }
+#endif
+
+#ifdef WINHTTP_OPTION_IGNORE_CERT_REVOCATION_OFFLINE
+  // Keep certificate validation enabled, but do not strand the wallet for a
+  // full request timeout when Windows cannot reach the CA's revocation
+  // service. This is common on restricted or intermittently connected hosts;
+  // an explicitly revoked certificate is still rejected.
+  if (parsed.secure) {
+    BOOL allow_offline_revocation = TRUE;
+    WinHttpSetOption(
+      req,
+      WINHTTP_OPTION_IGNORE_CERT_REVOCATION_OFFLINE,
+      &allow_offline_revocation,
+      sizeof(allow_offline_revocation)
+    );
+  }
+#endif
 
   std::wstring headers;
   if (method == "POST") {
@@ -264,9 +325,9 @@ HttpResponse do_request(
         body_len,
         0
       )) {
-    throw std::runtime_error("network request failed");
+    throw winhttp_error("WinHttpSendRequest");
   }
-  if (!WinHttpReceiveResponse(req, nullptr)) throw std::runtime_error("network request failed");
+  if (!WinHttpReceiveResponse(req, nullptr)) throw winhttp_error("WinHttpReceiveResponse");
 
   DWORD status = 0;
   DWORD status_size = sizeof(status);
@@ -282,11 +343,11 @@ HttpResponse do_request(
   std::string response_body;
   for (;;) {
     DWORD available = 0;
-    if (!WinHttpQueryDataAvailable(req, &available)) throw std::runtime_error("network request failed");
+    if (!WinHttpQueryDataAvailable(req, &available)) throw winhttp_error("WinHttpQueryDataAvailable");
     if (available == 0) break;
     std::vector<char> chunk(available);
     DWORD read = 0;
-    if (!WinHttpReadData(req, chunk.data(), available, &read)) throw std::runtime_error("network request failed");
+    if (!WinHttpReadData(req, chunk.data(), available, &read)) throw winhttp_error("WinHttpReadData");
     response_body.append(chunk.data(), chunk.data() + read);
   }
 
